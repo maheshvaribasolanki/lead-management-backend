@@ -1,3 +1,4 @@
+
 import type {
   Request,
   Response,
@@ -10,6 +11,13 @@ import {
   AuthServiceError,
   type LoginInput,
 } from "../services/auth.service";
+
+import {
+  acceptInvitation,
+  InvitationServiceError,
+} from "../services/invitation.service";
+
+import { acceptInvitationSchema } from "../validators/auth.validator";
 
 /**
  * POST /api/v1/auth/login
@@ -41,7 +49,40 @@ export const loginController: RequestHandler = async (
       return;
     }
 
-    // Pass unexpected errors to Express error handling.
+    next(error);
+  }
+};
+
+/**
+ * POST /api/v1/auth/accept-invitation
+ *
+ * Accept an invitation and activate the user's account.
+ */
+export const acceptInvitationController: RequestHandler = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const input = acceptInvitationSchema.parse(req.body);
+
+    const user = await acceptInvitation(input);
+
+    res.status(200).json({
+      success: true,
+      message: "Invitation accepted successfully. You can now log in.",
+      data: { user },
+    });
+  } catch (error: unknown) {
+    if (error instanceof InvitationServiceError) {
+      res.status(error.statusCode).json({
+        success: false,
+        message: error.message,
+      });
+
+      return;
+    }
+
     next(error);
   }
 };

@@ -1,9 +1,11 @@
-
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import mongoose from "mongoose";
 import type { z } from "zod";
 
 import User, { UserRole, UserStatus } from "../models/User";
+import Invitation, {
+  InvitationStatus,
+} from "../models/Invitation";
 
 import {
   listUsersQuerySchema,
@@ -25,15 +27,17 @@ const allowedSortFields = [
   "lastLoginAt",
 ] as const;
 
+const INVITATION_EXPIRY_HOURS = 24;
+
 /**
- * Escape special regular-expression characters in search input.
+ * Escape special regular-expression characters.
  */
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /**
- * Service error with an associated HTTP status code.
+ * User service error with an HTTP status code.
  */
 export class UserServiceError extends Error {
   public readonly statusCode: number;
@@ -174,62 +178,127 @@ export async function getUserById(userId: string) {
 }
 
 /**
- * Create a new user.
+ * Create a user and a pending invitation.
  *
- * New accounts start with invited status.
- * The User model hashes the password before saving.
+ * The user and invitation are created in one transaction.
+ * Only the invitation token hash is stored in MongoDB.
+ *
+ * The raw token is returned only in development mode.
  */
-export async function createUser(input: {
-  fullName: string;
-  email: string;
-  phone?: string;
-  employeeId?: string;
-  role: UserRole;
-  timezone?: string;
-  joiningDate?: string | Date;
-}) {
-  const email = input.email.trim().toLowerCase();
-
-  const existingUser = await User.findOne({ email }).lean();
-
-  if (existingUser) {
+export async function createUser(
+  input: {
+    fullName: string;
+    email: string;
+    phone?: string;
+    employeeId?: string;
+    role: UserRole;
+    timezone?: string;
+    joiningDate?: string | Date;
+  },
+  invitedById: string,
+) {
+  if (!mongoose.isValidObjectId(invitedById)) {
     throw new UserServiceError(
-      "Email address already exists.",
-      409,
+      "A valid inviting administrator ID is required.",
+      400,
     );
   }
 
-  const temporaryPassword = randomBytes(32).toString("hex");
+  const email = input.email.trim().toLowerCase();
+
+  const invitationToken = randomBytes(32).toString("hex");
+
+  const tokenHash = createHash("sha256")
+    .update(invitationToken)
+    .digest("hex");
+
+  const expiresAt = new Date(
+    Date.now() + INVITATION_EXPIRY_HOURS * 60 * 60 * 1000,
+  );
+
+  const session = await mongoose.startSession();
+
+  let createdUser:
+    | {
+        _id: mongoose.Types.ObjectId;
+        fullName: string;
+        email: string;
+        role: UserRole;
+        status: UserStatus;
+        phone?: string;
+        employeeId?: string;
+        timezone: string;
+        joiningDate?: Date;
+        createdAt: Date;
+        updatedAt: Date;
+      }
+    | undefined;
 
   try {
-    const user = await User.create({
-      fullName: input.fullName.trim(),
-      email,
-      password: temporaryPassword,
-      phone: input.phone,
-      employeeId: input.employeeId,
-      role: input.role,
-      status: UserStatus.INVITED,
-      timezone: input.timezone ?? "Asia/Kolkata",
-      joiningDate: input.joiningDate
-        ? new Date(input.joiningDate)
-        : undefined,
-    });
+    await session.withTransaction(async () => {
+      const existingUser = await User.findOne({ email })
+        .session(session)
+        .lean();
 
-    return {
-      _id: user._id,
-      fullName: user.fullName,
-      email: user.email,
-      role: user.role,
-      status: user.status,
-      phone: user.phone,
-      employeeId: user.employeeId,
-      timezone: user.timezone,
-      joiningDate: user.joiningDate,
-      createdAt: user.createdAt,
-      updatedAt: user.updatedAt,
-    };
+      if (existingUser) {
+        throw new UserServiceError(
+          "Email address already exists.",
+          409,
+        );
+      }
+
+      // The invited user will set their real password later.
+      const temporaryPassword = randomBytes(32).toString("hex");
+
+      const user = new User({
+        fullName: input.fullName.trim(),
+        email,
+        password: temporaryPassword,
+        phone: input.phone,
+        employeeId: input.employeeId,
+        role: input.role,
+        status: UserStatus.INVITED,
+        timezone: input.timezone ?? "Asia/Kolkata",
+        joiningDate: input.joiningDate
+          ? new Date(input.joiningDate)
+          : undefined,
+      });
+
+      await user.save({ session });
+
+      const invitation = new Invitation({
+        email,
+        role:
+          input.role === UserRole.ADMIN
+            ? "admin"
+            : "user",
+        tokenHash,
+        status: InvitationStatus.PENDING,
+        invitedBy: new mongoose.Types.ObjectId(invitedById),
+        expiresAt,
+      });
+
+      await invitation.save({ session });
+
+      createdUser = {
+        _id: user._id,
+        fullName: user.fullName,
+        email: user.email,
+        role: user.role,
+        status: user.status,
+        phone: user.phone,
+        employeeId: user.employeeId,
+        timezone: user.timezone,
+        joiningDate: user.joiningDate,
+        createdAt: user.createdAt,
+        updatedAt: user.updatedAt,
+      };
+    });
   } catch (error: unknown) {
+    if (error instanceof UserServiceError) {
+      throw error;
+    }
+
     if (
       typeof error === "object" &&
       error !== null &&
@@ -243,14 +312,32 @@ export async function createUser(input: {
     }
 
     throw error;
+  } finally {
+    await session.endSession();
   }
+
+  if (!createdUser) {
+    throw new UserServiceError(
+      "User and invitation could not be created.",
+      500,
+    );
+  }
+
+  return {
+    user: createdUser,
+    invitation: {
+      expiresAt,
+      ...(process.env.NODE_ENV === "development"
+        ? { token: invitationToken }
+        : {}),
+    },
+  };
 }
 
 /**
  * Update permitted user profile fields.
  *
- * Email, role, and status are intentionally excluded.
- * Those fields have separate administrative operations.
+ * Email, role, and status are handled separately.
  */
 export async function updateUser(
   userId: string,
@@ -282,7 +369,6 @@ export async function updateUser(
     user.timezone = input.timezone;
   }
 
-  // A null joiningDate clears the existing date.
   if (input.joiningDate !== undefined) {
     user.joiningDate = input.joiningDate
       ? new Date(input.joiningDate)
@@ -336,7 +422,6 @@ export async function changeUserRole(
     throw new UserServiceError("Invalid user ID.", 400);
   }
 
-  // Convert the validated string union to the model enum.
   const roleToAssign =
     newRole === "admin"
       ? UserRole.ADMIN
@@ -405,7 +490,6 @@ export async function changeUserStatus(
     throw new UserServiceError("User not found.", 404);
   }
 
-  // Prevent administrators from disabling their own accounts.
   if (user._id.toString() === currentAdminId) {
     throw new UserServiceError(
       "You cannot change your own account status.",
@@ -413,7 +497,6 @@ export async function changeUserStatus(
     );
   }
 
-  // Convert the validated status to the model enum.
   const statusToAssign =
     newStatus === "active"
       ? UserStatus.ACTIVE
@@ -445,4 +528,204 @@ export async function changeUserStatus(
     createdAt: user.createdAt,
     updatedAt: user.updatedAt,
   };
+}
+
+/**
+ * Resend an invitation to an invited user.
+ *
+ * Previous pending invitations are revoked before the new
+ * invitation is created.
+ *
+ * The raw token is returned only in development mode.
+ */
+export async function resendUserInvitation(
+  userId: string,
+  invitedById: string,
+) {
+  if (!mongoose.isValidObjectId(userId)) {
+    throw new UserServiceError("Invalid user ID.", 400);
+  }
+
+  if (!mongoose.isValidObjectId(invitedById)) {
+    throw new UserServiceError(
+      "A valid inviting administrator ID is required.",
+      400,
+    );
+  }
+
+  const invitationToken = randomBytes(32).toString("hex");
+
+  const tokenHash = createHash("sha256")
+    .update(invitationToken)
+    .digest("hex");
+
+  const expiresAt = new Date(
+    Date.now() + INVITATION_EXPIRY_HOURS * 60 * 60 * 1000,
+  );
+
+  const session = await mongoose.startSession();
+
+  let result:
+    | {
+        userId: string;
+        email: string;
+        expiresAt: Date;
+      }
+    | undefined;
+
+  try {
+    await session.withTransaction(async () => {
+      const user = await User.findById(userId).session(session);
+
+      if (!user) {
+        throw new UserServiceError("User not found.", 404);
+      }
+
+      if (user.status !== UserStatus.INVITED) {
+        throw new UserServiceError(
+          "An invitation can only be resent to a user awaiting acceptance.",
+          409,
+        );
+      }
+
+      const now = new Date();
+
+      await Invitation.updateMany(
+        {
+          email: user.email,
+          status: InvitationStatus.PENDING,
+        },
+        {
+          $set: {
+            status: InvitationStatus.REVOKED,
+            revokedAt: now,
+          },
+        },
+        { session },
+      );
+
+      const invitation = new Invitation({
+        email: user.email,
+        role:
+          user.role === UserRole.ADMIN
+            ? "admin"
+            : "user",
+        tokenHash,
+        status: InvitationStatus.PENDING,
+        invitedBy: new mongoose.Types.ObjectId(invitedById),
+        expiresAt,
+      });
+
+      await invitation.save({ session });
+
+      result = {
+        userId: user.id,
+        email: user.email,
+        expiresAt,
+      };
+    });
+  } catch (error: unknown) {
+    if (error instanceof UserServiceError) {
+      throw error;
+    }
+
+    throw error;
+  } finally {
+    await session.endSession();
+  }
+
+  if (!result) {
+    throw new UserServiceError(
+      "The invitation could not be resent.",
+      500,
+    );
+  }
+
+  return {
+    ...result,
+    ...(process.env.NODE_ENV === "development"
+      ? { token: invitationToken }
+      : {}),
+  };
+}
+
+/**
+ * Revoke a pending invitation.
+ *
+ * The user's account remains in the invited state, but the
+ * revoked token can no longer be used to accept the invitation.
+ */
+export async function revokeUserInvitation(userId: string) {
+  if (!mongoose.isValidObjectId(userId)) {
+    throw new UserServiceError("Invalid user ID.", 400);
+  }
+
+  const session = await mongoose.startSession();
+
+  let result:
+    | {
+        userId: string;
+        email: string;
+        status: InvitationStatus;
+      }
+    | undefined;
+
+  try {
+    await session.withTransaction(async () => {
+      const user = await User.findById(userId).session(session);
+
+      if (!user) {
+        throw new UserServiceError("User not found.", 404);
+      }
+
+      if (user.status !== UserStatus.INVITED) {
+        throw new UserServiceError(
+          "Only invitations for users awaiting acceptance can be revoked.",
+          409,
+        );
+      }
+
+      const invitation = await Invitation.findOne({
+        email: user.email,
+        status: InvitationStatus.PENDING,
+      })
+        .sort({ createdAt: -1 })
+        .session(session);
+
+      if (!invitation) {
+        throw new UserServiceError(
+          "No pending invitation was found for this user.",
+          404,
+        );
+      }
+
+      invitation.status = InvitationStatus.REVOKED;
+      invitation.revokedAt = new Date();
+
+      await invitation.save({ session });
+
+      result = {
+        userId: user.id,
+        email: user.email,
+        status: invitation.status,
+      };
+    });
+  } catch (error: unknown) {
+    if (error instanceof UserServiceError) {
+      throw error;
+    }
+
+    throw error;
+  } finally {
+    await session.endSession();
+  }
+
+  if (!result) {
+    throw new UserServiceError(
+      "The invitation could not be revoked.",
+      500,
+    );
+  }
+
+  return result;
 }

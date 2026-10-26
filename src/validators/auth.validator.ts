@@ -1,22 +1,29 @@
+
 import { z } from "zod";
+
 import {
   emailSchema,
   passwordSchema,
 } from "./common.validator";
 
-// Login request validation.
+/**
+ * Validate a login request.
+ *
+ * Existing passwords may follow older policies, so login
+ * does not apply the new-password complexity requirements.
+ */
 export const loginSchema = z.object({
   email: emailSchema,
 
-  // Do not apply the new-password complexity rules to login.
-  // Existing users may have passwords created under older policies.
   password: z
     .string()
     .min(1, "Password is required.")
     .max(1024, "Password is too long."),
 });
 
-// Accept an invitation and create the user's password.
+/**
+ * Validate an invitation acceptance request.
+ */
 export const acceptInvitationSchema = z
   .object({
     token: z
@@ -37,12 +44,16 @@ export const acceptInvitationSchema = z
     },
   );
 
-// Request a password reset email.
+/**
+ * Validate a forgot-password request.
+ */
 export const forgotPasswordSchema = z.object({
   email: emailSchema,
 });
 
-// Submit a password reset token and a new password.
+/**
+ * Validate a password-reset request.
+ */
 export const resetPasswordSchema = z
   .object({
     token: z
@@ -63,7 +74,9 @@ export const resetPasswordSchema = z
     },
   );
 
-// Change a password while logged in.
+/**
+ * Validate a logged-in user's password-change request.
+ */
 export const changePasswordSchema = z
   .object({
     currentPassword: z
@@ -92,7 +105,9 @@ export const changePasswordSchema = z
     },
   );
 
-// Export inferred TypeScript types.
+/**
+ * Export inferred TypeScript types.
+ */
 export type LoginInput = z.infer<typeof loginSchema>;
 
 export type AcceptInvitationInput = z.infer<

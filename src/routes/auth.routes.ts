@@ -1,8 +1,17 @@
+
 import { Router } from "express";
 
-import { loginController } from "../controllers/auth.controller";
+import {
+  loginController,
+  acceptInvitationController,
+} from "../controllers/auth.controller";
+
 import { validateBody } from "../middleware/validate.middleware";
-import { loginSchema } from "../validators/auth.validator";
+
+import {
+  loginSchema,
+  acceptInvitationSchema,
+} from "../validators/auth.validator";
 
 const router = Router();
 
@@ -15,6 +24,17 @@ router.post(
   "/login",
   validateBody(loginSchema),
   loginController,
+);
+
+/**
+ * @route   POST /api/v1/auth/accept-invitation
+ * @desc    Accept an invitation and activate the user's account
+ * @access  Public
+ */
+router.post(
+  "/accept-invitation",
+  validateBody(acceptInvitationSchema),
+  acceptInvitationController,
 );
 
 export default router;
